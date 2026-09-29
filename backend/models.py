@@ -76,3 +76,39 @@ class Alert(Base):
         DateTime,
         nullable=True
     )
+class PerformanceMetric(Base):
+    __tablename__ = "performance_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    device_id = Column(
+        Integer,
+        nullable=False,
+        index=True
+    )
+
+    device_name = Column(
+        String,
+        nullable=False
+    )
+
+    ip_address = Column(
+        String,
+        nullable=False
+    )
+
+    status = Column(
+        String,
+        nullable=False
+    )
+
+    latency = Column(
+        Float,
+        nullable=True
+    )
+
+    recorded_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        index=True
+    )

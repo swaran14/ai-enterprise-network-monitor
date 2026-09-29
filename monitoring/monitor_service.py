@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 
 from backend.database import SessionLocal
-from backend.models import Device
+from backend.models import Device, PerformanceMetric
 from monitoring.ping_monitor import ping_device
 from alerts.alert_service import (
     create_status_alert,
@@ -125,22 +125,23 @@ async def monitor_all_devices():
                         # Latency returned to normal
                         high_latency_counts[device.id] = 0
 
-                        if device.id in performance_degraded:
-                            performance_degraded.remove(device.id)
+                        # Ask the database whether this device
+                        # has an OPEN performance incident.
+                        recovery_alert = create_performance_alert(
+                            db=db,
+                            device=device,
+                            event_type="PERFORMANCE_RECOVERED"
+                        )
 
-                            recovery_alert = create_performance_alert(
-                                db=db,
-                                device=device,
-                                event_type="PERFORMANCE_RECOVERED"
+                        if recovery_alert:
+                            performance_degraded.discard(device.id)
+
+                            print(
+                                f"[PERFORMANCE RECOVERY] "
+                                f"{recovery_alert.severity} | "
+                                f"{recovery_alert.event_type} | "
+                                f"{device.name}"
                             )
-
-                            if recovery_alert:
-                                print(
-                                    f"[PERFORMANCE RECOVERY] "
-                                    f"{recovery_alert.severity} | "
-                                    f"{recovery_alert.event_type} | "
-                                    f"{device.name}"
-                                )
 
                 # ---------------------------------
                 # DEVICE FAILED TO RESPOND
@@ -186,10 +187,29 @@ async def monitor_all_devices():
                     )
 
                 # ---------------------------------
+                # PERFORMANCE METRIC HISTORY
+                # ---------------------------------
+
+                metric = PerformanceMetric(
+                    device_id=device.id,
+                    device_name=device.name,
+                    ip_address=device.ip_address,
+                    status=device.status,
+                    latency=device.latency,
+                    recorded_at=datetime.utcnow()
+                )
+
+                db.add(metric)
+
+
+
+                # ---------------------------------
                 # STATUS CHANGE DETECTION
                 # ---------------------------------
 
                 new_status = device.status
+
+                
 
                 if old_status != new_status:
 
