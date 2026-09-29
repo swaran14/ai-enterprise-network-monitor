@@ -4,7 +4,10 @@ from datetime import datetime
 from backend.database import SessionLocal
 from backend.models import Device
 from monitoring.ping_monitor import ping_device
-from alerts.alert_service import create_status_alert
+from alerts.alert_service import (
+    create_status_alert,
+    create_performance_alert
+)
 
 
 MONITOR_INTERVAL = 15
@@ -12,6 +15,15 @@ MONITOR_INTERVAL = 15
 # Number of consecutive failures required
 # before declaring a device offline.
 FAILURE_THRESHOLD = 3
+# Performance monitoring configuration
+HIGH_LATENCY_THRESHOLD = 100
+HIGH_LATENCY_COUNT_THRESHOLD = 3
+
+# Consecutive high-latency readings per device
+high_latency_counts = {}
+
+# Devices with a confirmed performance incident
+performance_degraded = set()
 
 # Stores consecutive failures:
 # {device_id: failure_count}
@@ -61,6 +73,74 @@ async def monitor_all_devices():
                         f"-> ONLINE "
                         f"| Latency: {result['latency']}"
                     )
+                    # ---------------------------------
+                    # LATENCY / PERFORMANCE MONITORING
+                    # ---------------------------------
+                    latency = result["latency"]
+
+                    if (
+                        latency is not None
+                        and latency > HIGH_LATENCY_THRESHOLD
+                    ):
+                        current_latency_count = high_latency_counts.get(
+                            device.id,
+                            0
+                        )
+
+                        if current_latency_count < HIGH_LATENCY_COUNT_THRESHOLD:
+                            current_latency_count += 1
+
+                        high_latency_counts[device.id] = current_latency_count
+
+                        print(
+                            f"[PERFORMANCE WARNING] "
+                            f"{device.name} high latency "
+                            f"{latency} ms "
+                            f"({current_latency_count}/"
+                            f"{HIGH_LATENCY_COUNT_THRESHOLD})"
+                        )
+
+                        # Confirm degradation only after 3 consecutive readings
+                        if (
+                            current_latency_count >= HIGH_LATENCY_COUNT_THRESHOLD
+                            and device.id not in performance_degraded
+                        ):
+                            performance_degraded.add(device.id)
+
+                            performance_alert = create_performance_alert(
+                                db=db,
+                                device=device,
+                                event_type="PERFORMANCE_DEGRADED"
+                            )
+
+                            if performance_alert:
+                                print(
+                                    f"[PERFORMANCE ALERT] "
+                                    f"{performance_alert.severity} | "
+                                    f"{performance_alert.event_type} | "
+                                    f"{device.name}"
+                                )
+
+                    else:
+                        # Latency returned to normal
+                        high_latency_counts[device.id] = 0
+
+                        if device.id in performance_degraded:
+                            performance_degraded.remove(device.id)
+
+                            recovery_alert = create_performance_alert(
+                                db=db,
+                                device=device,
+                                event_type="PERFORMANCE_RECOVERED"
+                            )
+
+                            if recovery_alert:
+                                print(
+                                    f"[PERFORMANCE RECOVERY] "
+                                    f"{recovery_alert.severity} | "
+                                    f"{recovery_alert.event_type} | "
+                                    f"{device.name}"
+                                )
 
                 # ---------------------------------
                 # DEVICE FAILED TO RESPOND
@@ -77,6 +157,8 @@ async def monitor_all_devices():
                     failures = failure_counts[device.id]
 
                     device.latency = None
+                    # Offline checks must not count toward consecutive high latency.
+                    high_latency_counts[device.id] = 0
 
                     print(
                         f"[WARNING] {device.name} "

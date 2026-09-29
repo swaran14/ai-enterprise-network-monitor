@@ -213,13 +213,12 @@ def get_alerts(
 
     return alerts
 
-@app.patch("/devices/{device_id}")
+@app.patch("/devices/{device_id}", response_model=DeviceResponse)
 def update_device(
     device_id: int,
     update: DeviceUpdate,
     db: Session = Depends(get_db)
 ):
-
     device = (
         db.query(Device)
         .filter(Device.id == device_id)
@@ -230,6 +229,22 @@ def update_device(
         raise HTTPException(
             status_code=404,
             detail="Device not found"
+        )
+
+    # Check whether another device already uses this IP
+    existing_device = (
+        db.query(Device)
+        .filter(
+            Device.ip_address == update.ip_address,
+            Device.id != device_id
+        )
+        .first()
+    )
+
+    if existing_device:
+        raise HTTPException(
+            status_code=400,
+            detail="A device with this IP address already exists"
         )
 
     device.ip_address = update.ip_address
