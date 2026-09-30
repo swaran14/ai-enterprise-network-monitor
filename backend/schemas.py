@@ -20,3 +20,8 @@ class DeviceResponse(DeviceCreate):
 
 class DeviceUpdate(BaseModel):
     ip_address: str
+class DeviceSSHCommandRequest(BaseModel):
+    username: str
+    password: str
+    command: str
+    port: int = 22

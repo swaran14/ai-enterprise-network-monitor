@@ -8,7 +8,12 @@ from monitoring.ping_monitor import ping_device
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import inspect, text, func
 from sqlalchemy.orm import Session
-from backend.schemas import DeviceCreate, DeviceResponse, DeviceUpdate
+from backend.schemas import (
+    DeviceCreate,
+    DeviceResponse,
+    DeviceUpdate,
+    DeviceSSHCommandRequest
+)
 
 from backend.database import Base, engine, get_db
 from backend.models import (
@@ -451,6 +456,61 @@ async def run_ssh_command(
     db.refresh(history)
 
     return result
+
+
+@app.post("/automation/devices/{device_id}/execute")
+async def run_device_ssh_command(
+    device_id: int,
+    request: DeviceSSHCommandRequest,
+    db: Session = Depends(get_db)
+):
+    # Find device in database
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # Execute SSH command using device IP from database
+    result = await asyncio.to_thread(
+        execute_ssh_command,
+        device.ip_address,
+        request.username,
+        request.password,
+        request.command,
+        request.port
+    )
+
+    # Store execution history
+    history = AutomationHistory(
+        host=device.ip_address,
+        username=request.username,
+        command=request.command.strip().lower(),
+        success=1 if result.get("success") else 0,
+        error_type=result.get("error_type"),
+        output=(
+            result.get("output")
+            or result.get("message")
+            or result.get("error_output")
+        )
+    )
+    db.add(history)
+    db.commit()
+
+    return {
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address
+        },
+        "result": result
+    }
 
 
 @app.get("/automation/history")
