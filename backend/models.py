@@ -171,3 +171,50 @@ class ConfigurationBackup(Base):
         default=datetime.utcnow,
         index=True
     )
+
+class ConfigurationChange(Base):
+    __tablename__ = "configuration_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    device_id = Column(
+        Integer,
+        nullable=False,
+        index=True
+    )
+
+    device_name = Column(
+        String,
+        nullable=False
+    )
+
+    ip_address = Column(
+        String,
+        nullable=False
+    )
+
+    old_backup_id = Column(
+        Integer,
+        nullable=False
+    )
+
+    new_backup_id = Column(
+        Integer,
+        nullable=False
+    )
+
+    change_detected = Column(
+        Integer,
+        default=0,
+        nullable=False
+    )
+
+    change_summary = Column(
+        String,
+        nullable=True
+    )
+
+    detected_at = Column(
+        DateTime,
+        default=datetime.utcnow
+    )

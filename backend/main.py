@@ -1,4 +1,5 @@
 import asyncio
+from automation.config_compare import compare_configurations
 from pydantic import BaseModel
 from automation.ssh_service import execute_ssh_command, ALLOWED_COMMANDS
 from contextlib import asynccontextmanager
@@ -19,7 +20,8 @@ from backend.models import (
     Alert,
     PerformanceMetric,
     AutomationHistory,
-    ConfigurationBackup
+    ConfigurationBackup,
+    ConfigurationChange
 )
 
 from backend.database import Base, engine, get_db
@@ -96,6 +98,130 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.post("/automation/devices/{device_id}/compare-config")
+def compare_device_configuration(
+    device_id: int,
+    db: Session = Depends(get_db)
+):
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # Only successful backups contain usable configurations.
+    backups = (
+        db.query(ConfigurationBackup)
+        .filter(
+            ConfigurationBackup.device_id == device_id,
+            ConfigurationBackup.backup_status == "SUCCESS"
+        )
+        .order_by(ConfigurationBackup.created_at.desc())
+        .limit(2)
+        .all()
+    )
+
+    if len(backups) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "At least two successful configuration "
+                "backups are required for comparison"
+            )
+        )
+
+    # Query is newest first.
+    new_backup = backups[0]
+    old_backup = backups[1]
+
+    comparison = compare_configurations(
+        old_backup.configuration,
+        new_backup.configuration
+    )
+
+    change = ConfigurationChange(
+        device_id=device.id,
+        device_name=device.name,
+        ip_address=device.ip_address,
+        old_backup_id=old_backup.id,
+        new_backup_id=new_backup.id,
+        change_detected=(
+            1 if comparison["change_detected"] else 0
+        ),
+        change_summary=comparison["summary"]
+    )
+
+    db.add(change)
+    db.commit()
+    db.refresh(change)
+
+    return {
+        "comparison_id": change.id,
+        "device_id": device.id,
+        "device_name": device.name,
+        "ip_address": device.ip_address,
+        "old_backup_id": old_backup.id,
+        "new_backup_id": new_backup.id,
+        "change_detected": comparison["change_detected"],
+        "summary": comparison["summary"],
+        "added_lines": comparison["added_lines"],
+        "removed_lines": comparison["removed_lines"],
+        "diff": comparison["diff"],
+        "detected_at": change.detected_at
+    }
+
+@app.get("/automation/config-changes")
+def get_configuration_changes(
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    limit = max(1, min(limit, 200))
+
+    changes = (
+        db.query(ConfigurationChange)
+        .order_by(ConfigurationChange.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return changes
+
+
+@app.get("/automation/devices/{device_id}/config-changes")
+def get_device_configuration_changes(
+    device_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    limit = max(1, min(limit, 200))
+
+    changes = (
+        db.query(ConfigurationChange)
+        .filter(ConfigurationChange.device_id == device_id)
+        .order_by(ConfigurationChange.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return changes
 
 @app.get("/")
 def home():
