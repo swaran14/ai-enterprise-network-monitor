@@ -14,6 +14,13 @@ from backend.schemas import (
     DeviceUpdate,
     DeviceSSHCommandRequest
 )
+from backend.models import (
+    Device,
+    Alert,
+    PerformanceMetric,
+    AutomationHistory,
+    ConfigurationBackup
+)
 
 from backend.database import Base, engine, get_db
 from backend.models import (
@@ -22,7 +29,6 @@ from backend.models import (
     PerformanceMetric,
     AutomationHistory
 )
-
 
 class SSHCommandRequest(BaseModel):
     host: str
@@ -511,6 +517,145 @@ async def run_device_ssh_command(
         },
         "result": result
     }
+
+
+@app.post("/automation/devices/{device_id}/backup")
+async def backup_device_configuration(
+    device_id: int,
+    username: str,
+    password: str,
+    port: int = 22,
+    db: Session = Depends(get_db)
+):
+    # Find device
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    command = "show running-config"
+
+    # Execute configuration backup command
+    result = await asyncio.to_thread(
+        execute_ssh_command,
+        device.ip_address,
+        username,
+        password,
+        command,
+        port
+    )
+
+    # Successful backup
+    if result.get("success"):
+        backup = ConfigurationBackup(
+            device_id=device.id,
+            device_name=device.name,
+            ip_address=device.ip_address,
+            configuration=result.get("output"),
+            backup_status="SUCCESS",
+            error_message=None
+        )
+
+    # Failed backup
+    else:
+        backup = ConfigurationBackup(
+            device_id=device.id,
+            device_name=device.name,
+            ip_address=device.ip_address,
+            configuration=None,
+            backup_status="FAILED",
+            error_message=(
+                result.get("message")
+                or result.get("error_output")
+                or "Unknown backup error"
+            )
+        )
+
+    db.add(backup)
+
+    # Also keep automation audit history
+    history = AutomationHistory(
+        host=device.ip_address,
+        username=username,
+        command=command,
+        success=1 if result.get("success") else 0,
+        error_type=result.get("error_type"),
+        output=(
+            result.get("output")
+            or result.get("message")
+            or result.get("error_output")
+        )
+    )
+
+    db.add(history)
+
+    db.commit()
+    db.refresh(backup)
+
+    return {
+        "backup_id": backup.id,
+        "device_id": device.id,
+        "device_name": device.name,
+        "ip_address": device.ip_address,
+        "backup_status": backup.backup_status,
+        "error_message": backup.error_message,
+        "created_at": backup.created_at
+    }
+
+
+@app.get("/automation/backups")
+def get_configuration_backups(
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    limit = max(1, min(limit, 200))
+
+    backups = (
+        db.query(ConfigurationBackup)
+        .order_by(ConfigurationBackup.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return backups
+
+
+@app.get("/automation/devices/{device_id}/backups")
+def get_device_configuration_backups(
+    device_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    limit = max(1, min(limit, 200))
+
+    backups = (
+        db.query(ConfigurationBackup)
+        .filter(ConfigurationBackup.device_id == device_id)
+        .order_by(ConfigurationBackup.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return backups
 
 
 @app.get("/automation/history")

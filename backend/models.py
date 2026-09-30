@@ -129,3 +129,45 @@ class AutomationHistory(Base):
         default=datetime.utcnow,
         index=True
     )
+
+class ConfigurationBackup(Base):
+    __tablename__ = "configuration_backups"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    device_id = Column(
+        Integer,
+        nullable=False,
+        index=True
+    )
+
+    device_name = Column(
+        String,
+        nullable=False
+    )
+
+    ip_address = Column(
+        String,
+        nullable=False
+    )
+
+    configuration = Column(
+        String,
+        nullable=True
+    )
+
+    backup_status = Column(
+        String,
+        nullable=False
+    )
+
+    error_message = Column(
+        String,
+        nullable=True
+    )
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        index=True
+    )
