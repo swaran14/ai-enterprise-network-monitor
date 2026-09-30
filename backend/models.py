@@ -112,3 +112,20 @@ class PerformanceMetric(Base):
         default=datetime.utcnow,
         index=True
     )
+
+
+class AutomationHistory(Base):
+    __tablename__ = "automation_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    host = Column(String, nullable=False, index=True)
+    username = Column(String, nullable=False)
+    command = Column(String, nullable=False)
+    success = Column(Integer, nullable=False)
+    error_type = Column(String, nullable=True)
+    output = Column(String, nullable=True)
+    executed_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        index=True
+    )

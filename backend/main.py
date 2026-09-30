@@ -1,4 +1,6 @@
 import asyncio
+from pydantic import BaseModel
+from automation.ssh_service import execute_ssh_command, ALLOWED_COMMANDS
 from contextlib import asynccontextmanager
 from datetime import datetime
 from monitoring.monitor_service import monitor_all_devices
@@ -9,7 +11,20 @@ from sqlalchemy.orm import Session
 from backend.schemas import DeviceCreate, DeviceResponse, DeviceUpdate
 
 from backend.database import Base, engine, get_db
-from backend.models import Device, Alert, PerformanceMetric
+from backend.models import (
+    Device,
+    Alert,
+    PerformanceMetric,
+    AutomationHistory
+)
+
+
+class SSHCommandRequest(BaseModel):
+    host: str
+    username: str
+    password: str
+    command: str
+    port: int = 22
 
 
 
@@ -396,6 +411,61 @@ def get_device_latency_history(
             for metric in metrics
         ]
     }
+
+
+@app.get("/automation/ssh/commands")
+def get_allowed_ssh_commands():
+    return {
+        "commands": sorted(ALLOWED_COMMANDS)
+    }
+
+
+@app.post("/automation/ssh/execute")
+async def run_ssh_command(
+    request: SSHCommandRequest,
+    db: Session = Depends(get_db)
+):
+    result = await asyncio.to_thread(
+        execute_ssh_command,
+        request.host,
+        request.username,
+        request.password,
+        request.command,
+        request.port
+    )
+
+    history = AutomationHistory(
+        host=request.host,
+        username=request.username,
+        command=request.command.strip().lower(),
+        success=1 if result.get("success") else 0,
+        error_type=result.get("error_type"),
+        output=(
+            result.get("output")
+            or result.get("message")
+            or result.get("error_output")
+        )
+    )
+    db.add(history)
+    db.commit()
+    db.refresh(history)
+
+    return result
+
+
+@app.get("/automation/history")
+def get_automation_history(
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    limit = max(1, min(limit, 200))
+    history = (
+        db.query(AutomationHistory)
+        .order_by(AutomationHistory.executed_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return history
 @app.get("/analytics/devices")
 def get_device_analytics(
     db: Session = Depends(get_db)
