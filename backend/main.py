@@ -31,6 +31,7 @@ from backend.models import (
     PerformanceMetric,
     AutomationHistory
 )
+from ai.diagnostic_engine import diagnose_device
 
 class SSHCommandRequest(BaseModel):
     host: str
@@ -222,7 +223,7 @@ def get_device_configuration_changes(
     )
 
     return changes
-
+ 
 @app.get("/")
 def home():
     return {
@@ -1082,4 +1083,125 @@ def get_alert_analytics(
             }
             for alert in recent_alerts
         ]
+    }
+
+@app.get("/ai/diagnose/{device_id}")
+def diagnose_network_device(
+    device_id: int,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------
+    # FIND DEVICE
+    # -----------------------------------
+
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # -----------------------------------
+    # OPEN INCIDENTS
+    # -----------------------------------
+
+    open_incidents = (
+        db.query(Alert)
+        .filter(
+            Alert.device_id == device_id,
+            Alert.incident_status == "OPEN"
+        )
+        .count()
+    )
+
+    # -----------------------------------
+    # OPEN CRITICAL ALERTS
+    # -----------------------------------
+
+    critical_alerts = (
+        db.query(Alert)
+        .filter(
+            Alert.device_id == device_id,
+            Alert.incident_status == "OPEN",
+            Alert.severity == "CRITICAL"
+        )
+        .count()
+    )
+
+    # -----------------------------------
+    # OPEN WARNING ALERTS
+    # -----------------------------------
+
+    warning_alerts = (
+        db.query(Alert)
+        .filter(
+            Alert.device_id == device_id,
+            Alert.incident_status == "OPEN",
+            Alert.severity == "WARNING"
+        )
+        .count()
+    )
+
+    # -----------------------------------
+    # LATEST CONFIGURATION CHANGE
+    # -----------------------------------
+
+    latest_change = (
+        db.query(ConfigurationChange)
+        .filter(
+            ConfigurationChange.device_id == device_id
+        )
+        .order_by(
+            ConfigurationChange.detected_at.desc()
+        )
+        .first()
+    )
+
+    configuration_changed = bool(
+        latest_change
+        and latest_change.change_detected == 1
+    )
+
+    # -----------------------------------
+    # RUN DIAGNOSTIC ENGINE
+    # -----------------------------------
+
+    diagnosis = diagnose_device(
+        status=device.status,
+        latency=device.latency,
+        open_incidents=open_incidents,
+        critical_alerts=critical_alerts,
+        warning_alerts=warning_alerts,
+        configuration_changed=configuration_changed
+    )
+
+    return {
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "device_type": device.device_type,
+            "status": device.status,
+            "latency_ms": device.latency,
+            "last_seen": device.last_seen
+        },
+
+        "evidence": {
+            "open_incidents": open_incidents,
+            "critical_alerts": critical_alerts,
+            "warning_alerts": warning_alerts,
+            "configuration_changed": configuration_changed,
+            "latest_configuration_change": (
+                latest_change.change_summary
+                if latest_change
+                else None
+            )
+        },
+
+        "diagnosis": diagnosis
     }
