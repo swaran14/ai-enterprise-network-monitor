@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 from automation.config_compare import compare_configurations
 from pydantic import BaseModel
 from automation.ssh_service import execute_ssh_command, ALLOWED_COMMANDS
@@ -1169,10 +1169,10 @@ def diagnose_network_device(
     )
 
     # -----------------------------------
-    # DIAGNOSTIC ENGINE
+    # RUN DIAGNOSTIC ENGINE
     # -----------------------------------
 
-    diagnosis = diagnose_device(
+        diagnosis = diagnose_device(
         status=device.status,
         latency=device.latency,
         open_incidents=open_incidents,
@@ -1180,10 +1180,6 @@ def diagnose_network_device(
         warning_alerts=warning_alerts,
         configuration_changed=configuration_changed
     )
-
-    # -----------------------------------
-    # HEALTH SCORE
-    # -----------------------------------
 
     health_score = calculate_health_score(
         status=device.status,
@@ -1221,106 +1217,3 @@ def diagnose_network_device(
 
         "diagnosis": diagnosis
     }
-
-@app.get("/ai/network-health")
-def get_network_health(
-    db: Session = Depends(get_db)
-):
-    devices = db.query(Device).all()
-
-    device_results = []
-    total_score = 0
-
-    for device in devices:
-
-        open_incidents = (
-            db.query(Alert)
-            .filter(
-                Alert.device_id == device.id,
-                Alert.incident_status == "OPEN"
-            )
-            .count()
-        )
-
-        critical_alerts = (
-            db.query(Alert)
-            .filter(
-                Alert.device_id == device.id,
-                Alert.incident_status == "OPEN",
-                Alert.severity == "CRITICAL"
-            )
-            .count()
-        )
-
-        warning_alerts = (
-            db.query(Alert)
-            .filter(
-                Alert.device_id == device.id,
-                Alert.incident_status == "OPEN",
-                Alert.severity == "WARNING"
-            )
-            .count()
-        )
-
-        latest_change = (
-            db.query(ConfigurationChange)
-            .filter(
-                ConfigurationChange.device_id == device.id
-            )
-            .order_by(
-                ConfigurationChange.detected_at.desc()
-            )
-            .first()
-        )
-
-        configuration_changed = bool(
-            latest_change
-            and latest_change.change_detected == 1
-        )
-
-        health = calculate_health_score(
-            status=device.status,
-            latency=device.latency,
-            open_incidents=open_incidents,
-            critical_alerts=critical_alerts,
-            warning_alerts=warning_alerts,
-            configuration_changed=configuration_changed
-        )
-
-        total_score += health["score"]
-
-        device_results.append({
-            "device_id": device.id,
-            "device_name": device.name,
-            "ip_address": device.ip_address,
-            "status": device.status,
-            "latency_ms": device.latency,
-            "health_score": health["score"],
-            "health": health["health"]
-        })
-
-    if devices:
-        overall_score = round(
-            total_score / len(devices),
-            2
-        )
-    else:
-        overall_score = 0
-
-    if overall_score >= 90:
-        overall_health = "EXCELLENT"
-    elif overall_score >= 75:
-        overall_health = "GOOD"
-    elif overall_score >= 50:
-        overall_health = "DEGRADED"
-    elif overall_score >= 25:
-        overall_health = "POOR"
-    else:
-        overall_health = "CRITICAL"
-
-    return {
-        "overall_network_score": overall_score,
-        "overall_network_health": overall_health,
-        "total_devices": len(devices),
-        "devices": device_results
-    }   
