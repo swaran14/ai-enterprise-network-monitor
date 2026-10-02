@@ -29,3 +29,12 @@ class DeviceSSHCommandRequest(BaseModel):
 class RemediationDecisionRequest(BaseModel):
     decision_by: str
     decision_note: str | None = None
+
+class TroubleshootingStepResultRequest(BaseModel):
+    result: str
+    problem_resolved: bool = False
+
+class TroubleshootingCommandRequest(BaseModel):
+    username: str
+    password: str
+    port: int = 22

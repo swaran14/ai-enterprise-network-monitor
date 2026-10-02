@@ -14,7 +14,10 @@ from backend.schemas import (
     DeviceResponse,
     DeviceUpdate,
     DeviceSSHCommandRequest,
-    RemediationDecisionRequest
+    RemediationDecisionRequest,
+    TroubleshootingStepResultRequest,
+    TroubleshootingCommandRequest
+
 )
 from backend.models import (
     Device,
@@ -37,6 +40,8 @@ from ai.diagnostic_engine import diagnose_device
 from ai.health_score import calculate_health_score
 from ai.root_cause import analyze_root_cause
 from ai.remediation_engine import recommend_remediation
+from ai.troubleshooting_engine import generate_troubleshooting_plan
+from backend.models import TroubleshootingSession, TroubleshootingStep
 
 class SSHCommandRequest(BaseModel):
     host: str
@@ -1629,3 +1634,580 @@ def reject_remediation_request(
         "decided_at": request_record.decided_at,
         "message": "Remediation request rejected."
     }
+
+@app.post("/ai/troubleshooting/start/{remediation_request_id}")
+def start_troubleshooting_session(
+    remediation_request_id: int,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------
+    # FIND REMEDIATION REQUEST
+    # -----------------------------------
+
+    remediation_request = (
+        db.query(RemediationRequest)
+        .filter(
+            RemediationRequest.id == remediation_request_id
+        )
+        .first()
+    )
+
+    if not remediation_request:
+        raise HTTPException(
+            status_code=404,
+            detail="Remediation request not found"
+        )
+
+    # -----------------------------------
+    # MUST BE APPROVED
+    # -----------------------------------
+
+    if remediation_request.status != "APPROVED":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Troubleshooting can only start from "
+                "an APPROVED remediation request"
+            )
+        )
+
+    # -----------------------------------
+    # PREVENT DUPLICATE SESSION
+    # -----------------------------------
+
+    existing_session = (
+        db.query(TroubleshootingSession)
+        .filter(
+            TroubleshootingSession.remediation_request_id
+            == remediation_request_id
+        )
+        .first()
+    )
+
+    if existing_session:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"A troubleshooting session already exists. "
+                f"Session ID: {existing_session.id}"
+            )
+        )
+
+    # -----------------------------------
+    # FIND DEVICE
+    # -----------------------------------
+
+    device = (
+        db.query(Device)
+        .filter(
+            Device.id == remediation_request.device_id
+        )
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # -----------------------------------
+    # CHECK LATEST CONFIG CHANGE
+    # -----------------------------------
+
+    latest_change = (
+        db.query(ConfigurationChange)
+        .filter(
+            ConfigurationChange.device_id == device.id
+        )
+        .order_by(
+            ConfigurationChange.detected_at.desc()
+        )
+        .first()
+    )
+
+    configuration_changed = bool(
+        latest_change
+        and latest_change.change_detected == 1
+    )
+
+    # -----------------------------------
+    # GENERATE AI TROUBLESHOOTING PLAN
+    # -----------------------------------
+
+    plan = generate_troubleshooting_plan(
+        action=remediation_request.action,
+        status=device.status,
+        latency=device.latency,
+        configuration_changed=configuration_changed
+    )
+
+    # -----------------------------------
+    # CREATE SESSION
+    # -----------------------------------
+
+    session = TroubleshootingSession(
+        remediation_request_id=remediation_request.id,
+        device_id=device.id,
+        device_name=device.name,
+        ip_address=device.ip_address,
+        action=remediation_request.action,
+        status="ACTIVE",
+        current_step=1,
+        total_steps=plan["total_steps"]
+    )
+
+    db.add(session)
+
+    # Get session ID before commit
+    db.flush()
+
+    # -----------------------------------
+    # SAVE ALL TROUBLESHOOTING STEPS
+    # -----------------------------------
+
+    for step_data in plan["steps"]:
+
+        step_status = (
+            "IN_PROGRESS"
+            if step_data["step"] == 1
+            else "PENDING"
+        )
+
+        step = TroubleshootingStep(
+            session_id=session.id,
+            step_number=step_data["step"],
+            title=step_data["title"],
+            step_type=step_data["type"],
+            instruction=step_data["instruction"],
+            command=step_data["command"],
+            status=step_status
+        )
+
+        db.add(step)
+
+    db.commit()
+    db.refresh(session)
+
+    # -----------------------------------
+    # RETURN FIRST STEP
+    # -----------------------------------
+
+    first_step = (
+        db.query(TroubleshootingStep)
+        .filter(
+            TroubleshootingStep.session_id == session.id,
+            TroubleshootingStep.step_number == 1
+        )
+        .first()
+    )
+
+    return {
+        "session_id": session.id,
+        "remediation_request_id": remediation_request.id,
+
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address,
+            "status": device.status
+        },
+
+        "action": session.action,
+        "session_status": session.status,
+        "current_step": session.current_step,
+        "total_steps": session.total_steps,
+        "started_at": session.started_at,
+
+        "step": {
+            "step_number": first_step.step_number,
+            "title": first_step.title,
+            "type": first_step.step_type,
+            "instruction": first_step.instruction,
+            "command": first_step.command,
+            "status": first_step.status
+        }
+    }
+
+@app.post("/ai/troubleshooting/{session_id}/step-result")
+def submit_troubleshooting_step_result(
+    session_id: int,
+    request: TroubleshootingStepResultRequest,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------
+    # FIND SESSION
+    # -----------------------------------
+
+    session = (
+        db.query(TroubleshootingSession)
+        .filter(
+            TroubleshootingSession.id == session_id
+        )
+        .first()
+    )
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Troubleshooting session not found"
+        )
+
+    if session.status != "ACTIVE":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Session is not active. "
+                f"Current status: {session.status}"
+            )
+        )
+
+    # -----------------------------------
+    # FIND CURRENT STEP
+    # -----------------------------------
+
+    current_step = (
+        db.query(TroubleshootingStep)
+        .filter(
+            TroubleshootingStep.session_id == session.id,
+            TroubleshootingStep.step_number == session.current_step
+        )
+        .first()
+    )
+
+    if not current_step:
+        raise HTTPException(
+            status_code=404,
+            detail="Current troubleshooting step not found"
+        )
+
+    # -----------------------------------
+    # COMPLETE CURRENT STEP
+    # -----------------------------------
+
+    current_step.status = "COMPLETED"
+    current_step.result = request.result
+    current_step.completed_at = datetime.utcnow()
+
+    # -----------------------------------
+    # PROBLEM RESOLVED
+    # -----------------------------------
+
+    if request.problem_resolved:
+
+        session.status = "RESOLVED"
+        session.completed_at = datetime.utcnow()
+        session.final_result = request.result
+
+        db.commit()
+        db.refresh(session)
+
+        return {
+            "session_id": session.id,
+            "session_status": session.status,
+            "completed_step": current_step.step_number,
+            "problem_resolved": True,
+            "final_result": session.final_result,
+            "message": (
+                "Problem marked as resolved. "
+                "Troubleshooting session completed."
+            )
+        }
+
+    # -----------------------------------
+    # MOVE TO NEXT STEP
+    # -----------------------------------
+
+    if session.current_step < session.total_steps:
+
+        session.current_step += 1
+
+        next_step = (
+            db.query(TroubleshootingStep)
+            .filter(
+                TroubleshootingStep.session_id == session.id,
+                TroubleshootingStep.step_number == session.current_step
+            )
+            .first()
+        )
+
+        if not next_step:
+            raise HTTPException(
+                status_code=500,
+                detail="Next troubleshooting step not found"
+            )
+
+        next_step.status = "IN_PROGRESS"
+
+        db.commit()
+        db.refresh(session)
+        db.refresh(next_step)
+
+        return {
+            "session_id": session.id,
+            "session_status": session.status,
+
+            "completed_step": current_step.step_number,
+            "completed_result": current_step.result,
+
+            "problem_resolved": False,
+
+            "current_step": session.current_step,
+            "total_steps": session.total_steps,
+
+            "next_step": {
+                "step_number": next_step.step_number,
+                "title": next_step.title,
+                "type": next_step.step_type,
+                "instruction": next_step.instruction,
+                "command": next_step.command,
+                "status": next_step.status
+            }
+        }
+
+    # -----------------------------------
+    # ALL STEPS FINISHED BUT NOT RESOLVED
+    # -----------------------------------
+
+    session.status = "ESCALATED"
+    session.completed_at = datetime.utcnow()
+    session.final_result = (
+        "Troubleshooting steps completed but "
+        "the problem was not resolved."
+    )
+
+    db.commit()
+    db.refresh(session)
+
+    return {
+        "session_id": session.id,
+        "session_status": session.status,
+        "completed_step": current_step.step_number,
+        "problem_resolved": False,
+        "message": (
+            "All troubleshooting steps were completed, "
+            "but the issue remains unresolved. "
+            "Manual escalation is required."
+        )
+    }
+@app.post("/ai/troubleshooting/{session_id}/run-current-command")
+async def run_troubleshooting_command(
+    session_id: int,
+    request: TroubleshootingCommandRequest,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------
+    # FIND SESSION
+    # -----------------------------------
+
+    session = (
+        db.query(TroubleshootingSession)
+        .filter(
+            TroubleshootingSession.id == session_id
+        )
+        .first()
+    )
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Troubleshooting session not found"
+        )
+
+    if session.status != "ACTIVE":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Session is not active. "
+                f"Current status: {session.status}"
+            )
+        )
+
+    # -----------------------------------
+    # FIND CURRENT STEP
+    # -----------------------------------
+
+    current_step = (
+        db.query(TroubleshootingStep)
+        .filter(
+            TroubleshootingStep.session_id == session.id,
+            TroubleshootingStep.step_number == session.current_step
+        )
+        .first()
+    )
+
+    if not current_step:
+        raise HTTPException(
+            status_code=404,
+            detail="Current troubleshooting step not found"
+        )
+
+    # -----------------------------------
+    # MUST BE COMMAND STEP
+    # -----------------------------------
+
+    if current_step.step_type != "COMMAND":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The current troubleshooting step is not "
+                "an executable command step"
+            )
+        )
+
+    if not current_step.command:
+        raise HTTPException(
+            status_code=400,
+            detail="No command is associated with this step"
+        )
+
+    command = current_step.command.strip().lower()
+
+    # -----------------------------------
+    # SAFETY CHECK
+    # -----------------------------------
+
+    if command not in ALLOWED_COMMANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This troubleshooting command is not in "
+                "the approved diagnostic command allowlist"
+            )
+        )
+
+    # -----------------------------------
+    # FIND DEVICE
+    # -----------------------------------
+
+    device = (
+        db.query(Device)
+        .filter(
+            Device.id == session.device_id
+        )
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # -----------------------------------
+    # EXECUTE SAFE SSH COMMAND
+    # -----------------------------------
+
+    result = await asyncio.to_thread(
+        execute_ssh_command,
+        device.ip_address,
+        request.username,
+        request.password,
+        command,
+        request.port
+    )
+
+    # -----------------------------------
+    # SAVE AUTOMATION HISTORY
+    # -----------------------------------
+
+    history = AutomationHistory(
+        host=device.ip_address,
+        username=request.username,
+        command=command,
+        success=1 if result.get("success") else 0,
+        error_type=result.get("error_type"),
+        output=(
+            result.get("output")
+            or result.get("message")
+            or result.get("error_output")
+        )
+    )
+
+    db.add(history)
+
+    # -----------------------------------
+    # COMMAND FAILED
+    # -----------------------------------
+
+    if not result.get("success"):
+
+        current_step.result = (
+            result.get("message")
+            or result.get("error_output")
+            or "Command execution failed"
+        )
+
+        db.commit()
+
+        return {
+            "session_id": session.id,
+            "step_number": current_step.step_number,
+            "command": command,
+            "execution_success": False,
+            "error_type": result.get("error_type"),
+            "error": current_step.result,
+            "step_status": current_step.status,
+            "message": (
+                "Automatic diagnostic execution failed. "
+                "The step remains IN_PROGRESS."
+            )
+        }
+
+    # -----------------------------------
+    # COMMAND SUCCEEDED
+    # -----------------------------------
+
+    current_step.result = result.get("output")
+    current_step.status = "COMPLETED"
+    current_step.completed_at = datetime.utcnow()
+
+    completed_step_number = current_step.step_number
+
+    # -----------------------------------
+    # MOVE TO NEXT STEP
+    # -----------------------------------
+
+    next_step = None
+
+    if session.current_step < session.total_steps:
+
+        session.current_step += 1
+
+        next_step = (
+            db.query(TroubleshootingStep)
+            .filter(
+                TroubleshootingStep.session_id == session.id,
+                TroubleshootingStep.step_number == session.current_step
+            )
+            .first()
+        )
+
+        if next_step:
+            next_step.status = "IN_PROGRESS"
+
+    db.commit()
+
+    response = {
+        "session_id": session.id,
+        "execution_success": True,
+        "completed_step": completed_step_number,
+        "command": command,
+        "command_output": current_step.result,
+        "session_status": session.status,
+        "current_step": session.current_step,
+        "total_steps": session.total_steps
+    }
+
+    if next_step:
+
+        response["next_step"] = {
+            "step_number": next_step.step_number,
+            "title": next_step.title,
+            "type": next_step.step_type,
+            "instruction": next_step.instruction,
+            "command": next_step.command,
+            "status": next_step.status
+        }
+
+    return response
