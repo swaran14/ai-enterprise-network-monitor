@@ -13,7 +13,8 @@ from backend.schemas import (
     DeviceCreate,
     DeviceResponse,
     DeviceUpdate,
-    DeviceSSHCommandRequest
+    DeviceSSHCommandRequest,
+    RemediationDecisionRequest
 )
 from backend.models import (
     Device,
@@ -21,7 +22,8 @@ from backend.models import (
     PerformanceMetric,
     AutomationHistory,
     ConfigurationBackup,
-    ConfigurationChange
+    ConfigurationChange,
+    RemediationRequest
 )
 
 from backend.database import Base, engine, get_db
@@ -33,6 +35,8 @@ from backend.models import (
 )
 from ai.diagnostic_engine import diagnose_device
 from ai.health_score import calculate_health_score
+from ai.root_cause import analyze_root_cause
+from ai.remediation_engine import recommend_remediation
 
 class SSHCommandRequest(BaseModel):
     host: str
@@ -1194,7 +1198,25 @@ def diagnose_network_device(
         configuration_changed=configuration_changed
     )
 
+    root_cause = analyze_root_cause(
+        status=device.status,
+        latency=device.latency,
+        open_incidents=open_incidents,
+        critical_alerts=critical_alerts,
+        warning_alerts=warning_alerts,
+        configuration_changed=configuration_changed
+    )
+    
+    remediation = recommend_remediation(
+        status=device.status,
+        latency=device.latency,
+        critical_alerts=critical_alerts,
+        warning_alerts=warning_alerts,
+        configuration_changed=configuration_changed
+    )
+
     return {
+
         "device": {
             "id": device.id,
             "name": device.name,
@@ -1219,9 +1241,12 @@ def diagnose_network_device(
             )
         },
 
-        "diagnosis": diagnosis
-    }
+        "diagnosis": diagnosis,
 
+        "root_cause_analysis": root_cause,
+
+        "remediation": remediation
+    }
 @app.get("/ai/network-health")
 def get_network_health(
     db: Session = Depends(get_db)
@@ -1323,4 +1348,284 @@ def get_network_health(
         "overall_network_health": overall_health,
         "total_devices": len(devices),
         "devices": device_results
-    }   
+    }
+
+
+@app.post("/ai/remediation/{device_id}/request")
+def create_remediation_request(
+    device_id: int,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------
+    # FIND DEVICE
+    # -----------------------------------
+
+    device = (
+        db.query(Device)
+        .filter(Device.id == device_id)
+        .first()
+    )
+
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    # -----------------------------------
+    # CURRENT ALERT EVIDENCE
+    # -----------------------------------
+
+    critical_alerts = (
+        db.query(Alert)
+        .filter(
+            Alert.device_id == device_id,
+            Alert.incident_status == "OPEN",
+            Alert.severity == "CRITICAL"
+        )
+        .count()
+    )
+
+    warning_alerts = (
+        db.query(Alert)
+        .filter(
+            Alert.device_id == device_id,
+            Alert.incident_status == "OPEN",
+            Alert.severity == "WARNING"
+        )
+        .count()
+    )
+
+    # -----------------------------------
+    # LATEST CONFIGURATION CHANGE
+    # -----------------------------------
+
+    latest_change = (
+        db.query(ConfigurationChange)
+        .filter(
+            ConfigurationChange.device_id == device_id
+        )
+        .order_by(
+            ConfigurationChange.detected_at.desc()
+        )
+        .first()
+    )
+
+    configuration_changed = bool(
+        latest_change
+        and latest_change.change_detected == 1
+    )
+
+    # -----------------------------------
+    # GENERATE REMEDIATION
+    # -----------------------------------
+
+    remediation = recommend_remediation(
+        status=device.status,
+        latency=device.latency,
+        critical_alerts=critical_alerts,
+        warning_alerts=warning_alerts,
+        configuration_changed=configuration_changed
+    )
+
+    # Healthy device -> no request required
+    if remediation["action"] == "NONE":
+        raise HTTPException(
+            status_code=400,
+            detail="No remediation is currently required for this device"
+        )
+
+    # -----------------------------------
+    # PREVENT DUPLICATE PENDING REQUEST
+    # -----------------------------------
+
+    existing_request = (
+        db.query(RemediationRequest)
+        .filter(
+            RemediationRequest.device_id == device_id,
+            RemediationRequest.action == remediation["action"],
+            RemediationRequest.status == "PENDING"
+        )
+        .first()
+    )
+
+    if existing_request:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"A pending remediation request already exists "
+                f"for this action. Request ID: {existing_request.id}"
+            )
+        )
+
+    # -----------------------------------
+    # CREATE REQUEST
+    # -----------------------------------
+
+    request_record = RemediationRequest(
+        device_id=device.id,
+        device_name=device.name,
+        ip_address=device.ip_address,
+
+        action=remediation["action"],
+        title=remediation["title"],
+        reason=remediation["reason"],
+
+        risk=remediation["risk"],
+
+        requires_approval=(
+            1 if remediation["requires_approval"] else 0
+        ),
+
+        status="PENDING"
+    )
+
+    db.add(request_record)
+    db.commit()
+    db.refresh(request_record)
+
+    return {
+        "request_id": request_record.id,
+
+        "device": {
+            "id": device.id,
+            "name": device.name,
+            "ip_address": device.ip_address
+        },
+
+        "action": request_record.action,
+        "title": request_record.title,
+        "reason": request_record.reason,
+        "risk": request_record.risk,
+
+        "requires_approval": bool(
+            request_record.requires_approval
+        ),
+
+        "status": request_record.status,
+        "requested_at": request_record.requested_at,
+
+        "suggested_commands": remediation[
+            "suggested_commands"
+        ]
+    }
+
+@app.get("/ai/remediation/requests")
+def get_remediation_requests(
+    status: str | None = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(RemediationRequest)
+
+    if status:
+        query = query.filter(
+            RemediationRequest.status == status.upper()
+        )
+
+    requests = (
+        query
+        .order_by(RemediationRequest.requested_at.desc())
+        .all()
+    )
+
+    return requests
+
+@app.post("/ai/remediation/requests/{request_id}/approve")
+def approve_remediation_request(
+    request_id: int,
+    decision: RemediationDecisionRequest,
+    db: Session = Depends(get_db)
+):
+    request_record = (
+        db.query(RemediationRequest)
+        .filter(RemediationRequest.id == request_id)
+        .first()
+    )
+
+    if not request_record:
+        raise HTTPException(
+            status_code=404,
+            detail="Remediation request not found"
+        )
+
+    if request_record.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Request cannot be approved because "
+                f"its current status is {request_record.status}"
+            )
+        )
+
+    request_record.status = "APPROVED"
+    request_record.decided_at = datetime.utcnow()
+    request_record.decision_by = decision.decision_by
+    request_record.decision_note = decision.decision_note
+
+    db.commit()
+    db.refresh(request_record)
+
+    return {
+        "request_id": request_record.id,
+        "device_id": request_record.device_id,
+        "device_name": request_record.device_name,
+        "action": request_record.action,
+        "risk": request_record.risk,
+        "status": request_record.status,
+        "decision_by": request_record.decision_by,
+        "decision_note": request_record.decision_note,
+        "decided_at": request_record.decided_at,
+        "execution_status": request_record.execution_status,
+        "message": (
+            "Remediation request approved. "
+            "No configuration change has been executed yet."
+        )
+    }
+
+@app.post("/ai/remediation/requests/{request_id}/reject")
+def reject_remediation_request(
+    request_id: int,
+    decision: RemediationDecisionRequest,
+    db: Session = Depends(get_db)
+):
+    request_record = (
+        db.query(RemediationRequest)
+        .filter(RemediationRequest.id == request_id)
+        .first()
+    )
+
+    if not request_record:
+        raise HTTPException(
+            status_code=404,
+            detail="Remediation request not found"
+        )
+
+    if request_record.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Request cannot be rejected because "
+                f"its current status is {request_record.status}"
+            )
+        )
+
+    request_record.status = "REJECTED"
+    request_record.decided_at = datetime.utcnow()
+    request_record.decision_by = decision.decision_by
+    request_record.decision_note = decision.decision_note
+
+    db.commit()
+    db.refresh(request_record)
+
+    return {
+        "request_id": request_record.id,
+        "device_id": request_record.device_id,
+        "device_name": request_record.device_name,
+        "action": request_record.action,
+        "risk": request_record.risk,
+        "status": request_record.status,
+        "decision_by": request_record.decision_by,
+        "decision_note": request_record.decision_note,
+        "decided_at": request_record.decided_at,
+        "message": "Remediation request rejected."
+    }

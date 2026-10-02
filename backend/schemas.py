@@ -25,3 +25,7 @@ class DeviceSSHCommandRequest(BaseModel):
     password: str
     command: str
     port: int = 22
+
+class RemediationDecisionRequest(BaseModel):
+    decision_by: str
+    decision_note: str | None = None

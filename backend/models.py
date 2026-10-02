@@ -218,3 +218,31 @@ class ConfigurationChange(Base):
         DateTime,
         default=datetime.utcnow
     )
+
+
+class RemediationRequest(Base):
+    __tablename__ = "remediation_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    device_id = Column(Integer, nullable=False, index=True)
+    device_name = Column(String, nullable=False)
+    ip_address = Column(String, nullable=False)
+
+    action = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    reason = Column(String, nullable=False)
+
+    risk = Column(String, nullable=False)
+    requires_approval = Column(Integer, default=1, nullable=False)
+
+    status = Column(String, default="PENDING", nullable=False)
+
+    requested_at = Column(DateTime, default=datetime.utcnow)
+
+    decided_at = Column(DateTime, nullable=True)
+    decision_by = Column(String, nullable=True)
+    decision_note = Column(String, nullable=True)
+
+    executed_at = Column(DateTime, nullable=True)
+    execution_status = Column(String, nullable=True)
